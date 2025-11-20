@@ -1,0 +1,413 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+
+#define SELENOID_1 26
+#define SELENOID_2 27
+
+#define BACKLIGHT 4
+#define TOUCH_CS 15
+
+#define TFT_GREY 0x5AEB
+#define TFT_DARKBLUE 0x0011
+#define TFT_LIGHTGREY 0xC618
+
+#define KEY_W 100
+#define KEY_H 45
+#define KEY_SPACING 6
+#define KEY_START_X 40
+#define KEY_START_Y 105
+
+#define BTN_WIDTH 220
+#define BTN_HEIGHT 60
+#define BTN_RADIUS 10
+
+#define MAX_PHONE_LENGTH 15
+#define MAX_OTP_LENGTH 6
+#define MAX_ISBN_LENGTH 13
+
+#define API_KEY "AIzaSyBsGm7Oc4pDiFgUiDF_47YA5TVnZu3EFmM"
+
+TFT_eSPI tft = TFT_eSPI();
+XPT2046_Touchscreen ts(TOUCH_CS);
+
+enum ScreenState {
+  MENU,
+  PENGAMBILAN_PHONE,
+  PENGAMBILAN_OTP,
+  PENGAMBILAN_ISBN,
+  PENGEMBALIAN_PHONE,
+  PENGEMBALIAN_OTP,
+  PENGEMBALIAN_ISBN
+};
+
+ScreenState currentScreen = MENU;
+
+int btnX, btnY1, btnY2;
+bool menuNeedsRedraw = true;
+
+String phoneNumber = "";
+String otpInput = "";
+String isbnNumber = "";
+String firestoreAmbilOTP = "";
+String firestoreReturnOTP = "";
+
+void drawButton(int x, int y, const char* label) {
+  tft.fillRoundRect(x, y, BTN_WIDTH, BTN_HEIGHT, BTN_RADIUS, TFT_BLACK);
+  tft.drawRoundRect(x, y, BTN_WIDTH, BTN_HEIGHT, BTN_RADIUS, TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(label, x + BTN_WIDTH / 2, y + BTN_HEIGHT / 2, 4);
+}
+
+void drawMenu() {
+  tft.fillScreen(TFT_GREY);
+  int screenW = tft.width();
+  int screenH = tft.height();
+  btnX = (screenW - BTN_WIDTH) / 2;
+  btnY1 = screenH / 2 - BTN_HEIGHT - 10;
+  btnY2 = screenH / 2 + 10;
+  drawButton(btnX, btnY1, "PENGAMBILAN");
+  drawButton(btnX, btnY2, "PENGEMBALIAN");
+}
+
+void drawTextBox(const String &text) {
+  int boxX = 20;
+  int boxY = 60;
+  int boxW = tft.width() - 40;
+  int boxH = 40;
+  tft.fillRoundRect(boxX, boxY, boxW, boxH, 5, TFT_WHITE);
+  tft.drawRoundRect(boxX, boxY, boxW, boxH, 5, TFT_BLACK);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString(text, boxX + 10, boxY + boxH / 2, 4);
+}
+
+void drawKeypad() {
+  const char* keys[12] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"};
+  for (int i = 0; i < 12; i++) {
+    int row = i / 3;
+    int col = i % 3;
+    int x = KEY_START_X + col * (KEY_W + KEY_SPACING);
+    int y = KEY_START_Y + row * (KEY_H + KEY_SPACING);
+    tft.fillRoundRect(x, y, KEY_W, KEY_H, 8, TFT_DARKBLUE);
+    tft.drawRoundRect(x, y, KEY_W, KEY_H, 8, TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, TFT_DARKBLUE);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(keys[i], x + KEY_W / 2, y + KEY_H / 2, 4);
+  }
+  int delX = KEY_START_X + 3 * (KEY_W + KEY_SPACING);
+  int delY = KEY_START_Y;
+  tft.fillRoundRect(delX, delY, KEY_W, KEY_H, 8, TFT_RED);
+  tft.drawRoundRect(delX, delY, KEY_W, KEY_H, 8, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("DEL", delX + KEY_W / 2, delY + KEY_H / 2, 4);
+  int okY = KEY_START_Y + (KEY_H + KEY_SPACING);
+  tft.fillRoundRect(delX, okY, KEY_W, KEY_H, 8, TFT_GREEN);
+  tft.drawRoundRect(delX, okY, KEY_W, KEY_H, 8, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_GREEN);
+  tft.drawString("OK", delX + KEY_W / 2, okY + KEY_H / 2, 4);
+  int backY = KEY_START_Y + 2 * (KEY_H + KEY_SPACING);
+  tft.fillRoundRect(delX, backY, KEY_W, KEY_H, 8, TFT_ORANGE);
+  tft.drawRoundRect(delX, backY, KEY_W, KEY_H, 8, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_ORANGE);
+  tft.drawString("BACK", delX + KEY_W / 2, backY + KEY_H / 2, 4);
+}
+
+int getTouchedKey(int x, int y) {
+  for (int i = 0; i < 12; i++) {
+    int row = i / 3;
+    int col = i % 3;
+    int keyX = KEY_START_X + col * (KEY_W + KEY_SPACING);
+    int keyY = KEY_START_Y + row * (KEY_H + KEY_SPACING);
+    if (x >= keyX && x < keyX + KEY_W && y >= keyY && y < keyY + KEY_H) return i;
+  }
+  int delX = KEY_START_X + 3 * (KEY_W + KEY_SPACING);
+  int delY = KEY_START_Y;
+  if (x >= delX && x < delX + KEY_W && y >= delY && y < delY + KEY_H) return 12;
+  int okY = KEY_START_Y + (KEY_H + KEY_SPACING);
+  if (x >= delX && x < delX + KEY_W && y >= okY && y < okY + KEY_H) return 13;
+  int backY = KEY_START_Y + 2 * (KEY_H + KEY_SPACING);
+  if (x >= delX && x < delX + KEY_W && y >= backY && y < backY + KEY_H) return 14;
+  return -1;
+}
+
+void drawInputLayout(const char* title, const String &value) {
+  tft.fillScreen(TFT_LIGHTGREY);
+  tft.setTextColor(TFT_BLACK, TFT_LIGHTGREY);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString(title, tft.width() / 2, 20, 4);
+  drawTextBox(value);
+  drawKeypad();
+}
+
+void showMessage(const char* msg) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(msg, tft.width() / 2, tft.height() / 2, 4);
+}
+
+String extractFieldString(const String &json, const char* fieldName) {
+  String key = "\"" + String(fieldName) + "\"";
+  int idx = json.indexOf(key);
+  if (idx == -1) return "";
+  idx = json.indexOf("\"stringValue\"", idx);
+  if (idx == -1) return "";
+  idx = json.indexOf(":", idx);
+  if (idx == -1) return "";
+  idx = json.indexOf("\"", idx);
+  if (idx == -1) return "";
+  int start = idx + 1;
+  int end = json.indexOf("\"", start);
+  if (end == -1) return "";
+  return json.substring(start, end);
+}
+
+bool fetchOTPFromFirestore() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  if (!client.connect("firestore.googleapis.com", 443)) {
+    Serial.println("Connection to Firestore failed");
+    return false;
+  }
+  String url = "/v1/projects/appuser-thesis/databases/(default)/documents/otp/KFDVPnMSNJLD4BHJqfox?key=";
+  url += API_KEY;
+  String request = String("GET ") + url + " HTTP/1.1\r\nHost: firestore.googleapis.com\r\nConnection: close\r\n\r\n";
+  client.print(request);
+  unsigned long start = millis();
+  while (client.connected() && !client.available() && millis() - start < 5000) {
+    delay(10);
+  }
+  String response = "";
+  while (client.available()) {
+    char c = client.read();
+    response += c;
+  }
+  int bodyIndex = response.indexOf("\r\n\r\n");
+  String body;
+  if (bodyIndex != -1) body = response.substring(bodyIndex + 4);
+  else body = response;
+  firestoreAmbilOTP = extractFieldString(body, "ambil");
+  firestoreReturnOTP = extractFieldString(body, "return");
+  Serial.print("Ambil OTP from Firestore: ");
+  Serial.println(firestoreAmbilOTP);
+  Serial.print("Return OTP from Firestore: ");
+  Serial.println(firestoreReturnOTP);
+  if (firestoreAmbilOTP.length() == 0 && firestoreReturnOTP.length() == 0) return false;
+  return true;
+}
+
+void unlockSolenoid(int pin) {
+  digitalWrite(pin, LOW);
+  delay(3000);
+  digitalWrite(pin, HIGH);
+}
+
+void handlePhoneInput(ScreenState nextScreen) {
+  phoneNumber = "";
+  drawInputLayout("Enter Phone Number:", phoneNumber);
+  while (true) {
+    if (!ts.touched()) {
+      delay(10);
+      continue;
+    }
+    TS_Point p = ts.getPoint();
+    int x = map(p.x, 3800, 200, 0, tft.width());
+    int y = map(p.y, 3800, 200, 0, tft.height());
+    int key = getTouchedKey(x, y);
+    if (key >= 0 && key <= 11) {
+      const char keys[12] = {'1','2','3','4','5','6','7','8','9','*','0','#'};
+      if (phoneNumber.length() < MAX_PHONE_LENGTH) {
+        phoneNumber += keys[key];
+        drawTextBox(phoneNumber);
+      }
+      delay(200);
+    } else if (key == 12) {
+      if (phoneNumber.length() > 0) {
+        phoneNumber.remove(phoneNumber.length() - 1);
+        drawTextBox(phoneNumber);
+      }
+      delay(200);
+    } else if (key == 13) {
+      Serial.print("Phone number entered: ");
+      Serial.println(phoneNumber);
+      currentScreen = nextScreen;
+      return;
+    } else if (key == 14) {
+      currentScreen = MENU;
+      menuNeedsRedraw = true;
+      return;
+    }
+  }
+}
+
+void handleOTPInput(bool isAmbil) {
+  otpInput = "";
+  drawInputLayout("Enter OTP:", otpInput);
+  while (true) {
+    if (!ts.touched()) {
+      delay(10);
+      continue;
+    }
+    TS_Point p = ts.getPoint();
+    int x = map(p.x, 3800, 200, 0, tft.width());
+    int y = map(p.y, 3800, 200, 0, tft.height());
+    int key = getTouchedKey(x, y);
+    if (key >= 0 && key <= 11) {
+      const char keys[12] = {'1','2','3','4','5','6','7','8','9','*','0','#'};
+      if (otpInput.length() < MAX_OTP_LENGTH) {
+        otpInput += keys[key];
+        drawTextBox(otpInput);
+      }
+      delay(200);
+    } else if (key == 12) {
+      if (otpInput.length() > 0) {
+        otpInput.remove(otpInput.length() - 1);
+        drawTextBox(otpInput);
+      }
+      delay(200);
+    } else if (key == 13) {
+      Serial.print("OTP entered: ");
+      Serial.println(otpInput);
+      if (!fetchOTPFromFirestore()) {
+        showMessage("Network Error");
+        delay(1500);
+        currentScreen = MENU;
+        menuNeedsRedraw = true;
+        return;
+      }
+      String expected = isAmbil ? firestoreAmbilOTP : firestoreReturnOTP;
+      if (expected.length() == 0) {
+        showMessage("No OTP Set");
+        delay(1500);
+        currentScreen = MENU;
+        menuNeedsRedraw = true;
+        return;
+      }
+      if (otpInput == expected) {
+        showMessage("OTP Correct");
+        delay(800);
+        currentScreen = isAmbil ? PENGAMBILAN_ISBN : PENGEMBALIAN_ISBN;
+        return;
+      } else {
+        showMessage("OTP Wrong");
+        delay(800);
+        otpInput = "";
+        drawInputLayout("Enter OTP:", otpInput);
+      }
+    } else if (key == 14) {
+      currentScreen = MENU;
+      menuNeedsRedraw = true;
+      return;
+    }
+  }
+}
+
+void handleISBNInput(bool isAmbil) {
+  isbnNumber = "";
+  drawInputLayout("Enter ISBN:", isbnNumber);
+  while (true) {
+    if (!ts.touched()) {
+      delay(10);
+      continue;
+    }
+    TS_Point p = ts.getPoint();
+    int x = map(p.x, 3800, 200, 0, tft.width());
+    int y = map(p.y, 3800, 200, 0, tft.height());
+    int key = getTouchedKey(x, y);
+    if (key >= 0 && key <= 11) {
+      const char keys[12] = {'1','2','3','4','5','6','7','8','9','*','0','#'};
+      if (isbnNumber.length() < MAX_ISBN_LENGTH) {
+        isbnNumber += keys[key];
+        drawTextBox(isbnNumber);
+      }
+      delay(200);
+    } else if (key == 12) {
+      if (isbnNumber.length() > 0) {
+        isbnNumber.remove(isbnNumber.length() - 1);
+        drawTextBox(isbnNumber);
+      }
+      delay(200);
+    } else if (key == 13) {
+      Serial.print("ISBN entered: ");
+      Serial.println(isbnNumber);
+      showMessage("Unlocking...");
+      if (isAmbil) unlockSolenoid(SELENOID_1);
+      else unlockSolenoid(SELENOID_2);
+      showMessage("Done");
+      delay(1000);
+      currentScreen = MENU;
+      menuNeedsRedraw = true;
+      return;
+    } else if (key == 14) {
+      currentScreen = MENU;
+      menuNeedsRedraw = true;
+      return;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BACKLIGHT, OUTPUT);
+  digitalWrite(BACKLIGHT, HIGH);
+  pinMode(SELENOID_1, OUTPUT);
+  pinMode(SELENOID_2, OUTPUT);
+  digitalWrite(SELENOID_1, HIGH);
+  digitalWrite(SELENOID_2, HIGH);
+  tft.init();
+  tft.setRotation(3);
+  tft.fillScreen(TFT_GREY);
+  ts.begin();
+  ts.setRotation(3);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi connected, IP: ");
+  Serial.println(WiFi.localIP());
+  menuNeedsRedraw = true;
+}
+
+void loop() {
+  if (currentScreen == MENU) {
+    if (menuNeedsRedraw) {
+      drawMenu();
+      menuNeedsRedraw = false;
+    }
+    if (!ts.touched()) return;
+    TS_Point p = ts.getPoint();
+    int x = map(p.x, 3800, 200, 0, tft.width());
+    int y = map(p.y, 3800, 200, 0, tft.height());
+    if (x > btnX && x < btnX + BTN_WIDTH && y > btnY1 && y < btnY1 + BTN_HEIGHT) {
+      currentScreen = PENGAMBILAN_PHONE;
+      delay(300);
+    } else if (x > btnX && x < btnX + BTN_WIDTH && y > btnY2 && y < btnY2 + BTN_HEIGHT) {
+      currentScreen = PENGEMBALIAN_PHONE;
+      delay(300);
+    }
+  } else if (currentScreen == PENGAMBILAN_PHONE) {
+    handlePhoneInput(PENGAMBILAN_OTP);
+  } else if (currentScreen == PENGEMBALIAN_PHONE) {
+    handlePhoneInput(PENGEMBALIAN_OTP);
+  } else if (currentScreen == PENGAMBILAN_OTP) {
+    handleOTPInput(true);
+  } else if (currentScreen == PENGEMBALIAN_OTP) {
+    handleOTPInput(false);
+  } else if (currentScreen == PENGAMBILAN_ISBN) {
+    handleISBNInput(true);
+  } else if (currentScreen == PENGEMBALIAN_ISBN) {
+    handleISBNInput(false);
+  }
+}
