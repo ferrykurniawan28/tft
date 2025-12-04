@@ -233,4 +233,8 @@
  .pio/libdeps/esp32doit-devkit-v1/TFT_eSPI/Extensions/Smooth_font.h \
  .pio/libdeps/esp32doit-devkit-v1/TFT_eSPI/Extensions/Button.h \
  .pio/libdeps/esp32doit-devkit-v1/TFT_eSPI/Extensions/Sprite.h \
- .pio/libdeps/esp32doit-devkit-v1/XPT2046_Touchscreen/XPT2046_Touchscreen.h
+ .pio/libdeps/esp32doit-devkit-v1/XPT2046_Touchscreen/XPT2046_Touchscreen.h \
+ C:/Users/safer/.platformio/packages/framework-arduinoespressif32/cores/esp32/HardwareSerial.h \
+ .pio/libdeps/esp32doit-devkit-v1/ArduinoJson/src/ArduinoJson.h \
+ .pio/libdeps/esp32doit-devkit-v1/ArduinoJson/src/ArduinoJson.hpp \
+ .pio/libdeps/esp32doit-devkit-v1/ArduinoJson/src/ArduinoJson/Configuration.hpp
