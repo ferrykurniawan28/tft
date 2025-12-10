@@ -384,6 +384,16 @@ void processIncomingData(String jsonData) {
     // General status update
     String message = doc["message"] | "";
     showStatusMessage(message);
+
+    // Handle AP Mode detection
+    if (message == "AP Mode Active") {
+      isInAPMode = true;
+      apModeMessage = "WiFi Setup Mode\nConnect to: MinderAP\nConfigure WiFi settings";
+      currentState = STATE_HOME;  // Ensure we're on home screen to show the message
+      tft.fillScreen(BACKGROUND_COLOR);
+      drawHomeScreen();
+    }
+    
     
   } else if (type == "sync_all_data") {
     // Full data sync
