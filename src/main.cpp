@@ -31,7 +31,14 @@ enum DisplayState {
   STATE_REMINDERS,
   STATE_SCHEDULE,
   STATE_ALARM,
-  STATE_DISPENSING
+  STATE_ON_REMINDERS,
+  STATE_TAKE_MEDICINE,
+  STATE_DISPENSING,
+  STATE_QUANTITY_CONFIRMATION,
+  STATE_JAM_ALERT,
+  STATE_WIFI_ERROR,
+  STATE_CONTROL_QUEUE_LIST,
+  STATE_CONTROL_QUEUE_CONFIRMATION
 };
 
 DisplayState currentState = STATE_HOME;
@@ -54,6 +61,35 @@ struct Reminder {
   String times[5];  // Store up to 5 reminder times
   int timeCount;    // Number of times for this reminder
   bool active;
+  int dosage;
+};
+
+// Reminder item for confirmation
+struct ReminderItem {
+  int id;
+  String medicine_name;
+  int container_id;
+  int dosage;
+};
+
+// Control action for confirmation
+struct ControlAction {
+  int control_id;
+  String action;
+  String medicine_name;
+  int container_id;
+  int quantity;
+  String message;
+};
+
+// Pending confirmation state
+struct PendingConfirmation {
+  ReminderItem reminders[10];
+  int reminder_count;
+  ControlAction control;
+  int type; // 0=medication, 1=device_control
+  int timeout_seconds;
+  unsigned long sent_at;
 };
 
 struct DailySchedule {
@@ -89,10 +125,33 @@ bool isDispensing = false;
 int dispensingContainer = 0;
 int dispensingDosage = 0;
 bool dispensingComplete = false;
+String dispensingMedicineName = "";
 
 // Sensor data
 float currentTemperature = 0.0;
 float currentHumidity = 0.0;
+
+// Confirmation state
+PendingConfirmation pendingConfirmation;
+bool hasPendingConfirmation = false;
+unsigned long confirmationStartTime = 0;
+const unsigned long CONFIRMATION_TIMEOUT = 60000; // 60 seconds
+
+// Jam alert state
+int jamAlertContainer = 0;
+String jamAlertMedicine = "";
+int jamAlertPillsRemaining = 0;
+
+// WiFi error state
+String wifiErrorMessage = "";
+String wifiErrorInstruction = "";
+
+// AP Mode state
+bool isInAPMode = false;
+String apModeMessage = "";
+
+// Clock display
+String currentTimeString = "--:--";
 
 // Colors
 #define BACKGROUND_COLOR 0x18E3
@@ -149,11 +208,21 @@ void sendDummyGroupedReminderAlert();
 void sendDummyAlarmStatus(bool active);
 void sendDummyDispensingStatus(const char* status);
 void sendDummyStockAlert();
+void drawTakeMedicineConfirmation();
+void drawQuantityConfirmation();
+void drawJamAlert();
+void drawWiFiError();
+void drawControlConfirmation();
+void handleTakeMedicineTouch(int x, int y);
+void handleQuantityConfirmationTouch(int x, int y);
+void handleJamAlertTouch(int x, int y);
+void handleWiFiErrorTouch(int x, int y);
+void handleControlQueueConfirmationTouch(int x, int y);
 
 
 void setup() {
   Serial.begin(115200);
-  SerialPort.begin(115200, SERIAL_8N1, 16, 17); // RX=16, TX=17
+  SerialPort.begin(9600, SERIAL_8N1, 16, 17); // RX=16, TX=17
 
   // Initialize TFT
   tft.init();
@@ -173,21 +242,109 @@ void setup() {
   
   Serial.println("TFT Display Ready");
   // syncTimeWithNTP();
+
+  // go to control queue confirmation for testing
+  // currentState = STATE_CONTROL_QUEUE_CONFIRMATION;
+
+  // go to reminder alert for testing
+  // showReminderAlert("Paracetamol", 1, 2, "reminder", "Time to take your medicine", "08:00");
+  // currentState = STATE_TAKE_MEDICINE;
 }
 
 void loop() {
-  // Check for incoming serial data
-  if (SerialPort.available()) {
-    String jsonData = SerialPort.readStringUntil('\n');
-    jsonData.trim();
+  // Frame protocol receiver
+  static enum { SYNC1, SYNC2, LENGTH_HIGH, LENGTH_LOW, DATA, CHECKSUM, END } rxState = SYNC1;
+  static uint16_t rxLength = 0;
+  static uint16_t rxCount = 0;
+  static uint8_t rxChecksum = 0;
+  static char rxBuffer[1024];
+  
+  while (SerialPort.available()) {
+    uint8_t b = SerialPort.read();
     
-    if (jsonData.length() > 0) {
-      processIncomingData(jsonData);
+    switch (rxState) {
+      case SYNC1:
+        if (b == 0x7E) {
+          rxState = SYNC2;
+        }
+        break;
+        
+      case SYNC2:
+        if (b == 0x7E) {
+          rxState = LENGTH_HIGH;
+        } else {
+          rxState = SYNC1;
+        }
+        break;
+        
+      case LENGTH_HIGH:
+        rxLength = b << 8;
+        rxState = LENGTH_LOW;
+        break;
+        
+      case LENGTH_LOW:
+        rxLength |= b;
+        if (rxLength > 0 && rxLength < sizeof(rxBuffer)) {
+          rxCount = 0;
+          rxChecksum = 0;
+          rxState = DATA;
+        } else {
+          rxState = SYNC1;
+        }
+        break;
+        
+      case DATA:
+        rxBuffer[rxCount++] = b;
+        rxChecksum ^= b;
+        if (rxCount >= rxLength) {
+          rxState = CHECKSUM;
+        }
+        break;
+        
+      case CHECKSUM:
+        if (b == rxChecksum) {
+          rxState = END;
+        } else {
+          Serial.println("Checksum error");
+          rxState = SYNC1;
+        }
+        break;
+        
+      case END:
+        if (b == 0x00) {
+          rxBuffer[rxCount] = '\0';
+          processIncomingData(String(rxBuffer));
+        }
+        rxState = SYNC1;
+        break;
     }
   }
   
   // Handle touch input
   handleTouchInput();
+  
+  // Check confirmation timeout (60 seconds)
+  if (hasPendingConfirmation) {
+    unsigned long elapsed = (millis() - confirmationStartTime) / 1000;
+    if (elapsed >= pendingConfirmation.timeout_seconds) {
+      // Timeout - auto cancel confirmation
+      hasPendingConfirmation = false;
+      currentState = STATE_HOME;
+      
+      // Send timeout response to minder
+      StaticJsonDocument<256> doc;
+      doc["type"] = "confirmation_response";
+      doc["confirmed"] = false;
+      doc["timeout"] = true;
+      doc["confirmation_type"] = pendingConfirmation.type;
+      
+      String jsonStr;
+      serializeJson(doc, jsonStr);
+      SerialPort.println(jsonStr);
+      
+      Serial.println("Confirmation timeout - auto cancelled");
+    }
+  }
   
   // Update display based on current state
   updateDisplay();
@@ -197,7 +354,7 @@ void loop() {
   if (millis() - lastDummyTime > 30000) {
     lastDummyTime = millis();
     // Uncomment one of the dummy data functions below for testing
-    generateDummyData(); // Sends all dummy data
+    // generateDummyData(); // Sends all dummy data
     // sendDummyDeviceInfo();
     // sendDummySensorData();
     // sendDummySystemStatus();
@@ -251,38 +408,80 @@ void processIncomingData(String jsonData) {
     
     Serial.println("Full data sync completed");
     
+    // Force redraw current screen with updated data
+    tft.fillScreen(BACKGROUND_COLOR);
+    switch (currentState) {
+      case STATE_HOME: drawHomeScreen(); break;
+      case STATE_CONTAINERS: drawContainersScreen(); break;
+      case STATE_REMINDERS: drawRemindersScreen(); break;
+      case STATE_SCHEDULE: drawScheduleScreen(); break;
+      default: updateDisplay(); break;
+    }
+    
   } else if (type == "containers_info") {
     // Container data update
     if (doc["containers"].is<JsonArray>()) {
       syncContainers(doc["containers"]);
+      // Redraw if we're on containers screen
+      if (currentState == STATE_CONTAINERS) {
+        tft.fillScreen(BACKGROUND_COLOR);
+        drawContainersScreen();
+      }
     }
     
   } else if (type == "reminders_info") {
     // Reminder data update
     if (doc["reminders"].is<JsonArray>()) {
       syncReminders(doc["reminders"]);
+      // Redraw if we're on reminders screen
+      if (currentState == STATE_REMINDERS) {
+        tft.fillScreen(BACKGROUND_COLOR);
+        drawRemindersScreen();
+      }
     }
     
   } else if (type == "daily_schedule") {
     // Daily schedule update
     if (doc["schedule"].is<JsonArray>()) {
       syncDailySchedule(doc["schedule"]);
+      // Redraw if we're on schedule screen
+      if (currentState == STATE_SCHEDULE) {
+        tft.fillScreen(BACKGROUND_COLOR);
+        drawScheduleScreen();
+      }
     }
     
   } else if (type == "sensor_data") {
     // Sensor data update
     currentTemperature = doc["temperature"] | 0.0;
     currentHumidity = doc["humidity"] | 0.0;
+    // Redraw home screen to show updated sensor data
+    if (currentState == STATE_HOME) {
+      tft.fillScreen(BACKGROUND_COLOR);
+      drawHomeScreen();
+    }
     
   } else if (type == "system_status") {
     // System status update
     String wifiStatus = doc["wifi_status"] | "disconnected";
     String mqttStatus = doc["mqtt_status"] | "disconnected";
+    bool apMode = doc["ap_mode"] | false;
     wifiConnected = (wifiStatus == "connected");
     mqttConnected = (mqttStatus == "connected");
     timeSynced = doc["rtc_time_set"] | false;
     currentTemperature = doc["temperature"] | 0.0;
     currentHumidity = doc["humidity"] | 0.0;
+    isInAPMode = apMode;
+    
+    // Force redraw current screen to show updated status
+    tft.fillScreen(BACKGROUND_COLOR);
+    switch (currentState) {
+      case STATE_HOME: drawHomeScreen(); break;
+      case STATE_CONTAINERS: drawContainersScreen(); break;
+      case STATE_REMINDERS: drawRemindersScreen(); break;
+      case STATE_SCHEDULE: drawScheduleScreen(); break;
+      default: updateDisplay(); break;
+    }
     
   } else if (type == "device_info") {
     // Device info
@@ -298,6 +497,46 @@ void processIncomingData(String jsonData) {
       currentState = STATE_ALARM;
     } else if (currentState == STATE_ALARM) {
       currentState = STATE_HOME;
+    }
+    
+  } else if (type == "confirmation_request") {
+    // Confirmation request from minder
+    hasPendingConfirmation = true;
+    confirmationStartTime = millis();
+    
+    pendingConfirmation.type = doc["confirmation_type"] | 0; // 0=medication, 1=device_control
+    pendingConfirmation.timeout_seconds = doc["timeout_seconds"] | 60;
+    pendingConfirmation.sent_at = millis();
+    
+    if (pendingConfirmation.type == 0) {
+      // Medication confirmation
+      JsonArray remindersArray = doc["reminders"];
+      pendingConfirmation.reminder_count = 0;
+      
+      for (JsonObject reminderObj : remindersArray) {
+        if (pendingConfirmation.reminder_count < 10) {
+          ReminderItem& item = pendingConfirmation.reminders[pendingConfirmation.reminder_count];
+          item.id = reminderObj["id"] | 0;
+          item.medicine_name = reminderObj["medicine_name"] | "";
+          item.container_id = reminderObj["container_id"] | 0;
+          item.dosage = reminderObj["dosage"] | 1;
+          pendingConfirmation.reminder_count++;
+        }
+      }
+      
+      currentState = STATE_TAKE_MEDICINE;
+      
+    } else if (pendingConfirmation.type == 1) {
+      // Device control confirmation
+      JsonObject controlObj = doc["control"];
+      pendingConfirmation.control.control_id = controlObj["control_id"] | 0;
+      pendingConfirmation.control.action = controlObj["action"] | "";
+      pendingConfirmation.control.medicine_name = controlObj["medicine_name"] | "";
+      pendingConfirmation.control.container_id = controlObj["container_id"] | 0;
+      pendingConfirmation.control.quantity = controlObj["quantity"] | 0;
+      pendingConfirmation.control.message = controlObj["message"] | "";
+      
+      currentState = STATE_CONTROL_QUEUE_CONFIRMATION;
     }
     
   } else if (type == "reminder_alert") {
@@ -318,18 +557,26 @@ void processIncomingData(String jsonData) {
     alarmType = "grouped_alert";
     
   } else if (type == "dispensing_status") {
-    // Dispensing status
+    // Dispensing status update
     String dispStatus = doc["status"] | "";
-    isDispensing = (dispStatus == "started");
+    dispensingMedicineName = doc["medicine_name"] | "";
     dispensingContainer = doc["container_number"] | 0;
     dispensingDosage = doc["dosage"] | 0;
-    dispensingComplete = (dispStatus == "completed");
     
-    if (isDispensing || dispensingComplete) {
-      currentState = STATE_DISPENSING;
-    } else if (currentState == STATE_DISPENSING) {
-      currentState = STATE_HOME;
+    if (dispStatus == "started" || dispStatus == "in_progress") {
+      isDispensing = true;
+      dispensingComplete = false;
+      if (currentState != STATE_DISPENSING) {
+        currentState = STATE_DISPENSING;
+      }
+    } else if (dispStatus == "completed") {
+      dispensingComplete = true;
     }
+    
+  } else if (type == "all_dispensing_completed") {
+    // All medicines dispensed, show quantity confirmation
+    isDispensing = false;
+    currentState = STATE_QUANTITY_CONFIRMATION;
     
   } else if (type == "stock_alert") {
     // Stock alert
@@ -337,6 +584,45 @@ void processIncomingData(String jsonData) {
     int current = doc["current_stock"] | 0;
     int minimum = doc["minimum_stock"] | 0;
     Serial.printf("Stock Alert: %s - Current: %d, Minimum: %d\n", medicineName.c_str(), current, minimum);
+    
+  } else if (type == "jam_alert") {
+    // Jam alert
+    jamAlertContainer = doc["container_number"] | 0;
+    jamAlertMedicine = doc["medicine_name"] | "";
+    jamAlertPillsRemaining = doc["pills_remaining"] | 0;
+    currentState = STATE_JAM_ALERT;
+    
+  } else if (type == "wifi_error_alert") {
+    // WiFi error alert
+    wifiErrorMessage = doc["message"] | "";
+    wifiErrorInstruction = doc["instruction"] | "";
+    currentState = STATE_WIFI_ERROR;
+    
+  } else if (type == "current_time") {
+    // Time update from minder
+    currentTimeString = doc["time"] | "00:00";
+    // Only redraw if on home screen
+    if (currentState == STATE_HOME) {
+      drawHomeScreen();
+    }
+    
+  } else if (type == "system_status") {
+    // System status update
+    String wifiStatus = doc["wifi_status"] | "disconnected";
+    String mqttStatus = doc["mqtt_status"] | "disconnected";
+    wifiConnected = (wifiStatus == "connected");
+    mqttConnected = (mqttStatus == "connected");
+    timeSynced = doc["rtc_time_set"] | false;
+    currentTemperature = doc["temperature"] | 0.0;
+    currentHumidity = doc["humidity"] | 0.0;
+    
+    // Check AP mode status
+    isInAPMode = doc["ap_mode"] | false;
+    if (isInAPMode) {
+      apModeMessage = "WiFi Setup Mode\nConnect to: MinderAP\nConfigure WiFi settings";
+    }
+
+    updateDisplay();
     
   } else if (type == "error") {
     // Error message
@@ -442,8 +728,23 @@ void handleTouchInput() {
       case STATE_ALARM:
         handleAlarmTouch(x, y);
         break;
+      case STATE_TAKE_MEDICINE:
+        handleTakeMedicineTouch(x, y);
+        break;
       case STATE_DISPENSING:
         handleDispensingTouch(x, y);
+        break;
+      case STATE_QUANTITY_CONFIRMATION:
+        handleQuantityConfirmationTouch(x, y);
+        break;
+      case STATE_JAM_ALERT:
+        handleJamAlertTouch(x, y);
+        break;
+      case STATE_WIFI_ERROR:
+        handleWiFiErrorTouch(x, y);
+        break;
+      case STATE_CONTROL_QUEUE_CONFIRMATION:
+        handleControlQueueConfirmationTouch(x, y);
         break;
     }
     
@@ -508,6 +809,154 @@ void handleDispensingTouch(int x, int y) {
   }
 }
 
+void handleTakeMedicineTouch(int x, int y) {
+  // Confirm button (left side, 145x60)
+  int confirmX = 10;
+  int confirmY = tft.height() - 70;
+  if (x >= confirmX && x <= confirmX + 145 && y >= confirmY && y <= confirmY + 60) {
+    // Send confirmation response
+    StaticJsonDocument<512> doc;
+    doc["type"] = "confirmation_response";
+    doc["confirmed"] = true;
+    doc["confirmation_type"] = pendingConfirmation.type;
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    SerialPort.println(jsonStr);
+    
+    hasPendingConfirmation = false;
+    currentState = STATE_DISPENSING;
+    return;
+  }
+  
+  // Cancel button (right side, 145x60)
+  int cancelX = 165;
+  int cancelY = tft.height() - 70;
+  if (x >= cancelX && x <= cancelX + 145 && y >= cancelY && y <= cancelY + 60) {
+    // Send cancel response
+    StaticJsonDocument<512> doc;
+    doc["type"] = "confirmation_response";
+    doc["confirmed"] = false;
+    doc["confirmation_type"] = pendingConfirmation.type;
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    SerialPort.println(jsonStr);
+    
+    hasPendingConfirmation = false;
+    currentState = STATE_HOME;
+    return;
+  }
+}
+
+void handleQuantityConfirmationTouch(int x, int y) {
+  // Yes button
+  int yesX = 20;
+  int yesY = tft.height() - 60;
+  if (x >= yesX && x <= yesX + 100 && y >= yesY && y <= yesY + 40) {
+    // Send quantity confirmed
+    StaticJsonDocument<256> doc;
+    doc["type"] = "quantity_confirmed";
+    doc["confirmed"] = true;
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    SerialPort.println(jsonStr);
+    
+    currentState = STATE_HOME;
+    return;
+  }
+  
+  // One More button
+  int oneMoreX = tft.width() - 120;
+  int oneMoreY = tft.height() - 60;
+  if (x >= oneMoreX && x <= oneMoreX + 100 && y >= oneMoreY && y <= oneMoreY + 40) {
+    // Send one more request
+    StaticJsonDocument<256> doc;
+    doc["type"] = "quantity_confirmed";
+    doc["confirmed"] = false;
+    doc["one_more"] = true;
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    SerialPort.println(jsonStr);
+    
+    currentState = STATE_DISPENSING;
+    return;
+  }
+}
+
+void handleJamAlertTouch(int x, int y) {
+  // Continue button
+  int continueX = tft.width() / 2 - 60;
+  int continueY = tft.height() - 60;
+  if (x >= continueX && x <= continueX + 120 && y >= continueY && y <= continueY + 40) {
+    // Send jam cleared
+    StaticJsonDocument<256> doc;
+    doc["type"] = "jam_cleared";
+    doc["container_number"] = jamAlertContainer;
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    SerialPort.println(jsonStr);
+    
+    currentState = STATE_DISPENSING;
+    return;
+  }
+}
+
+void handleWiFiErrorTouch(int x, int y) {
+  // OK button
+  int okX = tft.width() / 2 - 40;
+  int okY = tft.height() - 60;
+  if (x >= okX && x <= okX + 80 && y >= okY && y <= okY + 40) {
+    currentState = STATE_HOME;
+    return;
+  }
+}
+
+void handleControlQueueConfirmationTouch(int x, int y) {
+  // Confirm button (left side, 145x60)
+  int confirmX = 10;
+  int confirmY = tft.height() - 70;
+  if (x >= confirmX && x <= confirmX + 145 && y >= confirmY && y <= confirmY + 60) {
+    // Send confirmation response
+    StaticJsonDocument<512> doc;
+    doc["type"] = "confirmation_response";
+    doc["confirmed"] = true;
+    doc["confirmation_type"] = 1; // device_control
+    doc["control_id"] = pendingConfirmation.control.control_id;
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    SerialPort.println(jsonStr);
+    
+    hasPendingConfirmation = false;
+    currentState = STATE_HOME;
+    return;
+  }
+  
+  // Cancel button (right side, 145x60)
+  int cancelX = 165;
+  int cancelY = tft.height() - 70;
+  if (x >= cancelX && x <= cancelX + 145 && y >= cancelY && y <= cancelY + 60) {
+    // Send cancel response
+    StaticJsonDocument<512> doc;
+    doc["type"] = "confirmation_response";
+    doc["confirmed"] = false;
+    doc["confirmation_type"] = 1; // device_control
+    doc["control_id"] = pendingConfirmation.control.control_id;
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    SerialPort.println(jsonStr);
+    
+    hasPendingConfirmation = false;
+    currentState = STATE_HOME;
+    return;
+  }
+}
+
 void updateDisplay() {
   if (currentState != previousState) {
     // Clear screen and redraw for new state
@@ -531,8 +980,29 @@ void updateDisplay() {
     case STATE_ALARM:
       drawAlarmScreen();
       break;
+    case STATE_ON_REMINDERS:
+      // Not implemented yet
+      break;
+    case STATE_TAKE_MEDICINE:
+      drawTakeMedicineConfirmation();
+      break;
     case STATE_DISPENSING:
       drawDispensingScreen();
+      break;
+    case STATE_QUANTITY_CONFIRMATION:
+      drawQuantityConfirmation();
+      break;
+    case STATE_JAM_ALERT:
+      drawJamAlert();
+      break;
+    case STATE_WIFI_ERROR:
+      drawWiFiError();
+      break;
+    case STATE_CONTROL_QUEUE_LIST:
+      // Not implemented yet
+      break;
+    case STATE_CONTROL_QUEUE_CONFIRMATION:
+      drawControlConfirmation();
       break;
   }
 }
@@ -554,343 +1024,265 @@ void showStartupScreen() {
 }
 
 void drawHomeScreen() {
-  // Header
-  tft.setTextColor(TEXT_COLOR);
-  tft.setTextSize(1);
-  tft.setCursor(10, 10);
-  time_t now = time(nullptr);
-  struct tm* timeinfo = localtime(&now);
-  char buffer[30];
-  strftime(buffer, sizeof(buffer), "%d.%m %A %Y", timeinfo);
-  tft.print(buffer);
+  static String lastTimeString = "";
+  static bool lastAPMode = false;
+  static bool lastWifiConnected = false;
+  static bool lastMqttConnected = false;
+  static float lastTemp = -999;
+  static float lastHum = -999;
+  static DisplayState lastState = STATE_HOME;
   
-  // Connection status
-  tft.setTextSize(1);
-  tft.setCursor(160, 10);
+  // Force redraw if we just switched to this state
+  bool stateChanged = (lastState != currentState);
+  if (stateChanged) {
+    lastState = currentState;
+    lastTimeString = "";
+    lastTemp = -999;
+    lastHum = -999;
+  }
+  
+  // Only clear and redraw if something changed
+  bool needsRedraw = stateChanged || 
+                     (currentTimeString != lastTimeString) || 
+                     (isInAPMode != lastAPMode) ||
+                     (wifiConnected != lastWifiConnected) ||
+                     (mqttConnected != lastMqttConnected) ||
+                     (currentTemperature != lastTemp) ||
+                     (currentHumidity != lastHum);
+  
+  if (needsRedraw) {
+    // Clear specific areas that will be redrawn
+    tft.fillRect(0, 0, tft.width(), 60, BACKGROUND_COLOR); // Clear clock area
+    tft.fillRect(0, 60, 240, 60, BACKGROUND_COLOR); // Clear sensor data area
+    tft.fillRect(240, 60, 80, 60, BACKGROUND_COLOR); // Clear connection status area
+    
+    lastTimeString = currentTimeString;
+    lastAPMode = isInAPMode;
+    lastWifiConnected = wifiConnected;
+    lastMqttConnected = mqttConnected;
+    lastTemp = currentTemperature;
+    lastHum = currentHumidity;
+  }
+  
+  // Clock display (large, centered at top)
   tft.setTextColor(TEXT_COLOR);
-  tft.print("WiFi: ");
+  tft.setTextSize(5);
+  int clockWidth = currentTimeString.length() * 30; // Approximate width for size 5
+  tft.setCursor((tft.width() - clockWidth) / 2, 15);
+  tft.print(currentTimeString);
+  
+  // Connection status (smaller, right side)
+  tft.setTextSize(3);
+  tft.setCursor(250, 60);
+  tft.setTextColor(TEXT_COLOR);
+  tft.print("W:");
   tft.setTextColor(wifiConnected ? SUCCESS_COLOR : WARNING_COLOR);
   tft.print(wifiConnected ? "C" : "D");
   
   tft.setTextColor(TEXT_COLOR);
-  tft.setCursor(160, 20);
-  tft.print("MQTT: ");
+  tft.setCursor(250, 100);
+  tft.print("M:");
   tft.setTextColor(mqttConnected ? SUCCESS_COLOR : WARNING_COLOR);
   tft.print(mqttConnected ? "C" : "D");
   
   // Sensor data
   tft.setTextColor(TEXT_COLOR);
-  tft.setCursor(250, 10);
-  tft.printf("Temp: %.1fC", currentTemperature);
-  tft.setCursor(250, 20);
-  tft.printf("Hum: %.1f%%", currentHumidity);
+  tft.setTextSize(3);
+  tft.setCursor(10, 60);
+  tft.printf("%.1fC", currentTemperature);
+  tft.setCursor(10, 100);
+  tft.printf("%.1f%%", currentHumidity);
   
-  // List upcoming 2 reminders
-  tft.setTextColor(TEXT_COLOR);
-  tft.setTextSize(2);
-  tft.setCursor(10, 40);
-  tft.print("Upcoming Reminders:");
-
-  int reminderCount_shown = 0;
-  int yPos = 60;
-  for (int i = 0; i < reminderCount && reminderCount_shown < 2; i++) {
-    if (reminders[i].active) {
-      // Draw square box with pink background
-      uint16_t pinkColor = 0xF81F; // Pink color
-      tft.fillRect(10, yPos, tft.width() - 20, 35, pinkColor);
-      tft.drawRect(10, yPos, tft.width() - 20, 35, TEXT_COLOR);
-      
-      // Draw text
-      tft.setTextColor(TEXT_COLOR);
-      tft.setTextSize(2);
-      tft.setCursor(20, yPos + 10);
-      
-      // Format: Medicine Name: Dosage Time
-      tft.printf("%s:%d %s", 
-                 reminders[i].medicine_name.c_str(), 
-                 1,  // dosage (adjust if you have this in reminder struct)
-                 "14:00");  // time (adjust if you have this in reminder struct)
-      
-      yPos += 40;
-      reminderCount_shown++;
-    }
-  }
-  if (reminderCount_shown == 0) {
-    tft.setTextColor(TEXT_COLOR);
-    tft.setTextSize(1);
-    tft.setCursor(10, 70);
-    tft.print("No active reminders");
-  } else {
-    // "Reminders" button
-    drawButton(10, yPos + 5, tft.width() - 20, buttonHeight, "View All Reminders", HIGHLIGHT_COLOR);
-  }
-
-  // 2x2 Grid of Containers
-  int gridX1 = 5, gridX2 = 165;
-  int gridY1 = 180, gridY2 = 255;
-  int gridW = 150, gridH = 70;
-  
-  // Container 1 (Top-Left)
-  if (containerCount > 0) {
-    tft.drawRect(gridX1, gridY1, gridW, gridH, HIGHLIGHT_COLOR);
-    tft.setTextColor(TEXT_COLOR);
-    tft.setTextSize(1);
-    tft.setCursor(gridX1 + 8, gridY1 + 8);
-    tft.printf("Container 1");
-    tft.setCursor(gridX1 + 8, gridY1 + 25);
-    tft.printf("%s", containers[0].medicine_name.c_str());
-    tft.setCursor(gridX1 + 8, gridY1 + 40);
-    tft.printf("Stock: %d", containers[0].current_capacity);
-    if (containers[0].low_stock) {
-      tft.setTextColor(WARNING_COLOR);
-      tft.setCursor(gridX1 + 8, gridY1 + 70);
-      tft.print("LOW STOCK");
-    }
-  } else {
-    //shows empty
-    tft.drawRect(gridX1, gridY1, gridW, gridH, HIGHLIGHT_COLOR);
-    tft.setTextColor(TEXT_COLOR);
-    tft.setTextSize(1);
-    tft.setCursor(gridX1 + 8, gridY1 + 8);
-    tft.printf("Container 1");
-    tft.setCursor(gridX1 + 8, gridY1 + 25);
-    // tft.printf("Empty");
-  }
-  
-  // Container 2 (Top-Right)
-  if (containerCount > 1) {
-    tft.drawRect(gridX2, gridY1, gridW, gridH, HIGHLIGHT_COLOR);
-    tft.setTextColor(TEXT_COLOR);
-    tft.setTextSize(1);
-    tft.setCursor(gridX2 + 8, gridY1 + 8);
-    tft.printf("Container 2");
-    tft.setCursor(gridX2 + 8, gridY1 + 25);
-    tft.printf("%s", containers[1].medicine_name.c_str());
-    tft.setCursor(gridX2 + 8, gridY1 + 40);
-    tft.printf("Stock: %d", containers[1].current_capacity);
-    if (containers[1].low_stock) {
-      tft.setTextColor(WARNING_COLOR);
-      tft.setCursor(gridX2 + 8, gridY1 + 70);
-      tft.print("LOW STOCK");
-    }
-  } else {
-    //shows empty
-    tft.drawRect(gridX2, gridY1, gridW, gridH, HIGHLIGHT_COLOR);
-    tft.setTextColor(TEXT_COLOR);
-    tft.setTextSize(1);
-    tft.setCursor(gridX2 + 8, gridY1 + 8);
-    tft.printf("Container 2");
-    tft.setCursor(gridX2 + 8, gridY1 + 25);
-    // tft.printf("Empty");
-  }
-  
-  // Container 3 (Bottom-Left)
-  if (containerCount > 2) {
-    tft.drawRect(gridX1, gridY2, gridW, gridH, HIGHLIGHT_COLOR);
-    tft.setTextColor(TEXT_COLOR);
-    tft.setTextSize(1);
-    tft.setCursor(gridX1 + 8, gridY2 + 8);
-    tft.printf("Container 3");
-    tft.setCursor(gridX1 + 8, gridY2 + 25);
-    tft.printf("%s", containers[2].medicine_name.c_str());
-    tft.setCursor(gridX1 + 8, gridY2 + 40);
-    tft.printf("Stock: %d", containers[2].current_capacity);
-    if (containers[2].low_stock) {
-      tft.setTextColor(WARNING_COLOR);
-      tft.setCursor(gridX1 + 8, gridY2 + 50);
-      tft.print("LOW STOCK");
-    }
-  } else {
-    //shows empty
-    tft.drawRect(gridX1, gridY2, gridW, gridH, HIGHLIGHT_COLOR);
-    tft.setTextColor(TEXT_COLOR);
-    tft.setTextSize(1);
-    tft.setCursor(gridX1 + 8, gridY2 + 8);
-    tft.printf("Container 3");
-    tft.setCursor(gridX1 + 8, gridY2 + 25);
-    // tft.printf("Empty");
-  }
-  
-  // Container 4 (Bottom-Right)
-  if (containerCount > 3) {
-    tft.drawRect(gridX2, gridY2, gridW, gridH, HIGHLIGHT_COLOR);
-    tft.setTextColor(TEXT_COLOR);
-    tft.setTextSize(1);
-    tft.setCursor(gridX2 + 8, gridY2 + 8);
-    tft.printf("Container 4");
-    tft.setCursor(gridX2 + 8, gridY2 + 25);
-    tft.printf("%s", containers[3].medicine_name.c_str());
-    tft.setCursor(gridX2 + 8, gridY2 + 40);
-    tft.printf("Stock: %d", containers[3].current_capacity);
-    if (containers[3].low_stock) {
-      tft.setTextColor(WARNING_COLOR);
-      tft.setCursor(gridX2 + 8, gridY2 + 70);
-      tft.print("LOW STOCK");
-    }
-  } else {
-    //shows empty
-    tft.drawRect(gridX2, gridY2, gridW, gridH, HIGHLIGHT_COLOR);
-    tft.setTextColor(TEXT_COLOR);
-    tft.setTextSize(1);
-    tft.setCursor(gridX2 + 8, gridY2 + 8);
-    tft.printf("Container 4");
-    tft.setCursor(gridX2 + 8, gridY2 + 25);
-    // tft.printf("Empty");
-  }
-
-  // TODO: add control queue data from main esp
-  // List Control Queue
-  tft.setTextColor(TEXT_COLOR);
-  tft.setTextSize(2);
-  tft.setCursor(10, 330);
-  tft.print("Control Queue:");
-
-  // List first 2 control queue
-  // Control Queue display (similar to reminders style)
-  int queueCount_shown = 0;
-  int queueYPos = 350;
-  for (int i = 0; i < 2; i++) {  // Show first 2 queue items
-    // Draw square box with blue background
-    uint16_t blueColor = 0x041F; // Blue color
-    tft.fillRect(10, queueYPos, tft.width() - 20, 35, blueColor);
-    tft.drawRect(10, queueYPos, tft.width() - 20, 35, TEXT_COLOR);
+  // AP Mode message (center of screen)
+  if (isInAPMode) {
+    int boxX = 20;
+    int boxY = tft.height() / 2 - 60;
+    int boxW = tft.width() - 40;
+    int boxH = 120;
     
-    // Draw text
-    tft.setTextColor(TEXT_COLOR);
+    // Orange box
+    tft.drawRect(boxX, boxY, boxW, boxH, TFT_ORANGE);
+    tft.drawRect(boxX + 1, boxY + 1, boxW - 2, boxH - 2, TFT_ORANGE);
+    
+    // Title
+    tft.setTextColor(TFT_ORANGE);
+    tft.setTextSize(2);
+    tft.setCursor(boxX + 20, boxY + 15);
+    tft.print("WiFi Setup Mode");
+    
+    // Instructions
+    tft.setTextSize(2);
+    tft.setCursor(boxX + 20, boxY + 45);
+    tft.print("Connect to:");
+    tft.setCursor(boxX + 20, boxY + 70);
+    tft.print("MinderAP");
+    tft.setCursor(boxX + 20, boxY + 95);
     tft.setTextSize(1);
-    tft.setCursor(20, queueYPos + 5);
-    tft.printf("Queue #%d", i + 1);
-    
-    tft.setCursor(20, queueYPos + 17);
-    tft.printf("Container %d: Paracetamol x10", i + 1);
-    
-    queueYPos += 40;
-    queueCount_shown++;
-  }
-  
-  // Draw button to see more queues
-  if (queueCount_shown > 0) {
-    drawButton(10, queueYPos + 5, tft.width() - 20, buttonHeight, "View All Queues", HIGHLIGHT_COLOR);
+    tft.print("Configure WiFi settings");
   }
 }
 
 void drawContainersScreen() {
+  static int lastContainerCount = -1;
+  
+  // Clear screen if container count changed
+  if (containerCount != lastContainerCount) {
+    tft.fillScreen(BACKGROUND_COLOR);
+    lastContainerCount = containerCount;
+  }
+  
   // Header
   tft.setTextColor(TEXT_COLOR);
-  tft.setTextSize(2);
+  tft.setTextSize(3);
   tft.setCursor(10, 10);
-  tft.print("Medicine Containers");
+  tft.print("Containers");
   
   // Back button
   drawButton(buttonMargin, buttonMargin, 60, 30, "Back", HIGHLIGHT_COLOR);
   
   // Container list
-  int yPos = 50;
+  int yPos = 60;
   for (int i = 0; i < containerCount && yPos < tft.height() - 50; i++) {
     drawContainerItem(10, yPos, containers[i]);
-    yPos += 45;
+    yPos += 50;
   }
   
   if (containerCount == 0) {
     tft.setTextColor(TEXT_COLOR);
-    tft.setTextSize(1);
+    tft.setTextSize(2);
     tft.setCursor(10, 80);
-    tft.print("No containers configured");
+    tft.print("No containers");
   }
 }
 
 void drawRemindersScreen() {
+  static int lastReminderCount = -1;
+  
+  // Clear screen if reminder count changed
+  int activeCount = getActiveReminderCount();
+  if (activeCount != lastReminderCount) {
+    tft.fillScreen(BACKGROUND_COLOR);
+    lastReminderCount = activeCount;
+  }
+  
   // Header
   tft.setTextColor(TEXT_COLOR);
-  tft.setTextSize(2);
-  tft.setCursor(80, 10);
-  tft.print("Medicine Reminders");
+  tft.setTextSize(3);
+  tft.setCursor(50, 10);
+  tft.print("Reminders");
   
   // Back button
   drawButton(buttonMargin, buttonMargin, 60, 30, "Back", HIGHLIGHT_COLOR);
   
   // Reminder list
-  int yPos = 50;
+  int yPos = 60;
   for (int i = 0; i < reminderCount && yPos < tft.height() - 50; i++) {
     if (reminders[i].active) {
       drawReminderItem(10, yPos, reminders[i]);
-      yPos += 40;
+      yPos += 45;
     }
   }
   
-  if (getActiveReminderCount() == 0) {
+  if (activeCount == 0) {
     tft.setTextColor(TEXT_COLOR);
-    tft.setTextSize(1);
+    tft.setTextSize(2);
     tft.setCursor(10, 80);
-    tft.print("No active reminders");
+    tft.print("No reminders");
   }
 }
 
 void drawScheduleScreen() {
+  static int lastScheduleCount = -1;
+  
+  // Clear screen if schedule count changed
+  if (scheduleCount != lastScheduleCount) {
+    tft.fillScreen(BACKGROUND_COLOR);
+    lastScheduleCount = scheduleCount;
+  }
+  
   // Header
   tft.setTextColor(TEXT_COLOR);
-  tft.setTextSize(2);
+  tft.setTextSize(3);
   tft.setCursor(10, 10);
-  tft.print("Daily Schedule");
+  tft.print("Schedule");
   
   // Back button
   drawButton(buttonMargin, buttonMargin, 60, 30, "Back", HIGHLIGHT_COLOR);
   
   // Schedule list
-  int yPos = 50;
+  int yPos = 60;
   for (int i = 0; i < scheduleCount && yPos < tft.height() - 50; i++) {
     drawScheduleItem(10, yPos, dailySchedule[i]);
-    yPos += 35;
+    yPos += 40;
   }
   
   if (scheduleCount == 0) {
     tft.setTextColor(TEXT_COLOR);
-    tft.setTextSize(1);
+    tft.setTextSize(2);
     tft.setCursor(10, 80);
-    tft.print("No schedule available");
+    tft.print("No schedule");
   }
 }
 
 void drawAlarmScreen() {
   tft.fillScreen(ALARM_COLOR);
   tft.setTextColor(TFT_WHITE);
-  tft.setTextSize(3);
+  tft.setTextSize(4);
   
   // Alarm title
-  tft.setCursor(tft.width() / 2 - 60, 40);
+  tft.setCursor(tft.width() / 2 - 75, 40);
   tft.print("ALERT!");
   
-  tft.setTextSize(2);
-  tft.setCursor(tft.width() / 2 - 100, 80);
-  tft.print("Time for Medicine");
+  tft.setTextSize(3);
+  tft.setCursor(20, 100);
+  tft.print("Medicine");
+  tft.setCursor(20, 130);
+  tft.print("Time");
   
   // Medicine info
   tft.setTextSize(2);
-  tft.setCursor(tft.width() / 2 - 80, 120);
+  tft.setCursor(20, 170);
   if (!alarmMessage.isEmpty()) {
     tft.print(alarmMessage);
   } else {
-    tft.print("Check your medication");
+    tft.print("Check medication");
   }
   
-  // Dismiss button
-  drawButton(tft.width() / 2 - 50, tft.height() - 80, 100, 40, "Dismiss", TFT_WHITE);
+  // Dismiss button (larger)
+  tft.fillRect(tft.width() / 2 - 60, tft.height() - 80, 120, 50, TFT_WHITE);
+  tft.setTextColor(ALARM_COLOR);
+  tft.setTextSize(2);
+  tft.setCursor(tft.width() / 2 - 45, tft.height() - 65);
+  tft.print("DISMISS");
 }
 
 void drawDispensingScreen() {
-  tft.fillScreen(BACKGROUND_COLOR);
+  static bool lastIsDispensing = false;
+  static bool lastDispensingComplete = false;
+  
+  // Clear screen if dispensing state changed
+  if (isDispensing != lastIsDispensing || dispensingComplete != lastDispensingComplete) {
+    tft.fillScreen(BACKGROUND_COLOR);
+    lastIsDispensing = isDispensing;
+    lastDispensingComplete = dispensingComplete;
+  }
+  
   tft.setTextColor(TEXT_COLOR);
-  tft.setTextSize(2);
   
   if (isDispensing && !dispensingComplete) {
-    tft.setCursor(tft.width() / 2 - 100, 60);
-    tft.print("Dispensing...");
+    tft.setTextSize(3);
+    tft.setCursor(30, 60);
+    tft.print("Dispensing");
     
-    tft.setCursor(tft.width() / 2 - 80, 100);
+    tft.setTextSize(2);
+    tft.setCursor(30, 110);
+    tft.print(dispensingMedicineName);
+    
+    tft.setCursor(30, 140);
     tft.printf("Container: %d", dispensingContainer);
     
-    tft.setCursor(tft.width() / 2 - 60, 130);
-    tft.printf("Dosage: %d", dispensingDosage);
+    tft.setCursor(30, 170);
+    tft.printf("Pills: %d", dispensingDosage);
     
     // Loading animation
     static unsigned long lastAnim = 0;
@@ -899,85 +1291,98 @@ void drawDispensingScreen() {
       lastAnim = millis();
       animState = (animState + 1) % 4;
       
-      tft.fillRect(tft.width() / 2 - 30, 160, 60, 10, BACKGROUND_COLOR);
+      tft.fillRect(30, 220, 120, 15, BACKGROUND_COLOR);
       for (int i = 0; i <= animState; i++) {
-        tft.fillRect(tft.width() / 2 - 30 + i * 15, 160, 10, 10, HIGHLIGHT_COLOR);
+        tft.fillRect(30 + i * 30, 220, 20, 15, HIGHLIGHT_COLOR);
       }
     }
   } else if (dispensingComplete) {
-    tft.setCursor(tft.width() / 2 - 80, 60);
+    tft.setTextSize(3);
+    tft.setCursor(50, 60);
     tft.print("Complete!");
     
-    tft.setCursor(tft.width() / 2 - 100, 100);
-    tft.printf("Dispensed %d pills", dispensingDosage);
+    tft.setTextSize(2);
+    tft.setCursor(30, 120);
+    tft.printf("Dispensed:");
     
-    tft.setCursor(tft.width() / 2 - 80, 130);
-    tft.printf("from Container %d", dispensingContainer);
+    tft.setCursor(30, 150);
+    tft.print(dispensingMedicineName);
     
-    drawButton(tft.width() / 2 - 40, tft.height() - 60, 80, 30, "OK", SUCCESS_COLOR);
+    tft.setCursor(30, 180);
+    tft.printf("%d pills", dispensingDosage);
+    
+    tft.setCursor(30, 210);
+    tft.printf("Container: %d", dispensingContainer);
+    
+    tft.fillRect(tft.width() / 2 - 50, tft.height() - 70, 100, 50, SUCCESS_COLOR);
+    tft.setTextColor(TFT_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(tft.width() / 2 - 20, tft.height() - 55);
+    tft.print("OK");
   }
 }
 
 void drawContainerItem(int x, int y, Container container) {
   // Container box
-  tft.drawRect(x, y, tft.width() - 20, 40, HIGHLIGHT_COLOR);
-  tft.fillRect(x + 1, y + 1, (tft.width() - 22) * container.current_capacity / container.max_capacity, 38, 
+  tft.drawRect(x, y, tft.width() - 20, 45, HIGHLIGHT_COLOR);
+  tft.fillRect(x + 1, y + 1, (tft.width() - 22) * container.current_capacity / container.max_capacity, 43, 
                container.low_stock ? WARNING_COLOR : SUCCESS_COLOR);
   
   // Text
   tft.setTextColor(TEXT_COLOR);
-  tft.setTextSize(1);
+  tft.setTextSize(2);
   tft.setCursor(x + 5, y + 5);
   tft.print(container.medicine_name);
   
-  tft.setCursor(x + 5, y + 20);
-  tft.printf("Stock: %d/%d", container.current_capacity, container.max_capacity);
+  tft.setCursor(x + 5, y + 25);
+  tft.printf("%d/%d", container.current_capacity, container.max_capacity);
   
   if (container.low_stock) {
     tft.setTextColor(WARNING_COLOR);
-    tft.setCursor(x + 120, y + 20);
-    tft.print("LOW STOCK");
+    tft.setCursor(x + 150, y + 25);
+    tft.print("LOW");
   }
 }
 
 void drawReminderItem(int x, int y, Reminder reminder) {
   // Draw rectangle box with pink background
   uint16_t pinkColor = 0xF81F; // Pink color
-  tft.fillRect(x, y, tft.width() - 20, 35, pinkColor);
-  tft.drawRect(x, y, tft.width() - 20, 35, TEXT_COLOR);
+  tft.fillRect(x, y, tft.width() - 20, 40, pinkColor);
+  tft.drawRect(x, y, tft.width() - 20, 40, TEXT_COLOR);
   
   // Draw text
   tft.setTextColor(TEXT_COLOR);
-  tft.setTextSize(1);
+  tft.setTextSize(2);
   
   tft.setCursor(x + 8, y + 5);
   tft.print(reminder.medicine_name);
   
-  // Build time string from all times
+  // Build time string from all times (show first 2)
   String timeStr = "";
-  for (int i = 0; i < reminder.timeCount; i++) {
+  for (int i = 0; i < reminder.timeCount && i < 2; i++) {
     if (i > 0) timeStr += ", ";
     timeStr += reminder.times[i];
   }
+  if (reminder.timeCount > 2) timeStr += "...";
   
-  tft.setCursor(x + 8, y + 17);
-  tft.printf("Container: %d | %s", reminder.container_id, timeStr.c_str());
+  tft.setCursor(x + 8, y + 22);
+  tft.printf("C%d | %s", reminder.container_id, timeStr.c_str());
 }
 
 void drawScheduleItem(int x, int y, DailySchedule schedule) {
   tft.setTextColor(TEXT_COLOR);
-  tft.setTextSize(1);
+  tft.setTextSize(2);
   
   tft.setCursor(x, y);
   tft.printf("%s - %s", schedule.time.c_str(), schedule.medicine_name.c_str());
   
-  tft.setCursor(x, y + 15);
-  tft.printf("Dosage: %d | Status: %s", schedule.dosage, schedule.status.c_str());
+  tft.setCursor(x, y + 20);
+  tft.printf("%d pills", schedule.dosage);
   
   // Status indicator
   uint16_t statusColor = (schedule.status == "completed") ? SUCCESS_COLOR : 
                          (schedule.status == "pending") ? WARNING_COLOR : TEXT_COLOR;
-  tft.fillCircle(x + tft.width() - 30, y + 8, 4, statusColor);
+  tft.fillCircle(x + tft.width() - 30, y + 12, 6, statusColor);
 }
 
 void drawButton(int x, int y, int w, int h, String label, uint16_t color) {
@@ -1023,6 +1428,263 @@ void showControlQueueResult(int queueId, bool success, String message) {
   } else {
     showErrorMessage(resultMsg);
   }
+}
+
+void drawTakeMedicineConfirmation() {
+  tft.fillScreen(BACKGROUND_COLOR);
+  tft.setTextColor(TEXT_COLOR);
+  
+  // Title
+  tft.setTextSize(3);
+  tft.setCursor(20, 15);
+  tft.print("Medication");
+  
+  // Timer - clear area first
+  tft.fillRect(270, 15, 50, 20, BACKGROUND_COLOR);
+  unsigned long elapsed = (millis() - confirmationStartTime) / 1000;
+  int remaining = pendingConfirmation.timeout_seconds - elapsed;
+  if (remaining < 0) remaining = 0;
+  tft.setTextSize(2);
+  tft.setCursor(270, 15);
+  tft.printf("%ds", remaining);
+  
+  // Medicine list
+  int yPos = 50;
+  tft.setTextSize(2);
+  for (int i = 0; i < pendingConfirmation.reminder_count && i < 10; i++) {
+    ReminderItem& item = pendingConfirmation.reminders[i];
+    
+    tft.setCursor(10, yPos);
+    tft.print(item.medicine_name);
+    
+    tft.setCursor(10, yPos + 20);
+    tft.setTextSize(2);
+    tft.printf("Container %d | %d pills", item.container_id, item.dosage);
+    
+    yPos += 50;
+    
+    if (yPos > tft.height() - 140) break; // Stop if too many
+  }
+  
+  // Confirm button (left side, bigger for elderly)
+  tft.fillRect(10, tft.height() - 70, 145, 60, SUCCESS_COLOR);
+  tft.drawRect(10, tft.height() - 70, 145, 60, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(3);
+  tft.setCursor(20, tft.height() - 55);
+  tft.print("CONFIRM");
+  
+  // Cancel button (right side, bigger for elderly)
+  tft.fillRect(165, tft.height() - 70, 145, 60, ALARM_COLOR);
+  tft.drawRect(165, tft.height() - 70, 145, 60, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(3);
+  tft.setCursor(185, tft.height() - 55);
+  tft.print("CANCEL");
+}
+
+void drawQuantityConfirmation() {
+  tft.fillScreen(BACKGROUND_COLOR);
+  tft.setTextColor(TEXT_COLOR);
+  
+  // Title
+  tft.setTextSize(3);
+  tft.setCursor(30, 20);
+  tft.print("Check Pills");
+  
+  // Medicine info
+  tft.setTextSize(2);
+  int yPos = 80;
+  for (int i = 0; i < pendingConfirmation.reminder_count && i < 10; i++) {
+    ReminderItem& item = pendingConfirmation.reminders[i];
+    
+    tft.setCursor(20, yPos);
+    tft.print(item.medicine_name);
+    
+    tft.setCursor(20, yPos + 25);
+    tft.printf("Expected: %d pills", item.dosage);
+    
+    yPos += 60;
+    
+    if (yPos > tft.height() - 140) break;
+  }
+  
+  // Question
+  tft.setTextSize(2);
+  tft.setCursor(20, tft.height() - 120);
+  tft.print("Got correct amount?");
+  
+  // Yes button (left)
+  tft.fillRect(20, tft.height() - 60, 100, 40, SUCCESS_COLOR);
+  tft.drawRect(20, tft.height() - 60, 100, 40, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(45, tft.height() - 45);
+  tft.print("YES");
+  
+  // One More button (right)
+  tft.fillRect(tft.width() - 120, tft.height() - 60, 100, 40, WARNING_COLOR);
+  tft.drawRect(tft.width() - 120, tft.height() - 60, 100, 40, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(tft.width() - 105, tft.height() - 50);
+  tft.print("ONE");
+  tft.setCursor(tft.width() - 105, tft.height() - 35);
+  tft.print("MORE");
+}
+
+void drawJamAlert() {
+  tft.fillScreen(ALARM_COLOR);
+  tft.setTextColor(TFT_WHITE);
+  
+  // Warning icon (!)
+  tft.setTextSize(4);
+  tft.setCursor(tft.width() / 2 - 10, 20);
+  tft.print("!");
+  
+  // Title
+  tft.setTextSize(3);
+  tft.setCursor(40, 80);
+  tft.print("JAM DETECTED");
+  
+  // Details
+  tft.setTextSize(2);
+  tft.setCursor(20, 130);
+  tft.printf("Container: %d", jamAlertContainer);
+  
+  tft.setCursor(20, 155);
+  tft.print(jamAlertMedicine);
+  
+  tft.setCursor(20, 180);
+  tft.printf("%d pills remaining", jamAlertPillsRemaining);
+  
+  // Instructions
+  tft.setTextSize(2);
+  tft.setCursor(20, 220);
+  tft.print("Please clear the jam");
+  tft.setCursor(20, 245);
+  tft.print("and press Continue");
+  
+  // Continue button
+  tft.fillRect(tft.width() / 2 - 60, tft.height() - 60, 120, 40, TFT_WHITE);
+  tft.setTextColor(ALARM_COLOR);
+  tft.setTextSize(2);
+  tft.setCursor(tft.width() / 2 - 50, tft.height() - 45);
+  tft.print("CONTINUE");
+}
+
+void drawWiFiError() {
+  tft.fillScreen(ALARM_COLOR);
+  tft.setTextColor(TFT_WHITE);
+  
+  // Error icon (X)
+  tft.setTextSize(4);
+  tft.setCursor(tft.width() / 2 - 10, 20);
+  tft.print("X");
+  
+  // Title
+  tft.setTextSize(3);
+  tft.setCursor(30, 80);
+  tft.print("WiFi Error");
+  
+  // Message
+  tft.setTextSize(2);
+  tft.setCursor(20, 130);
+  // Word wrap the message
+  int lineY = 130;
+  int lineLen = 0;
+  String word = "";
+  for (unsigned int i = 0; i < wifiErrorMessage.length(); i++) {
+    char c = wifiErrorMessage[i];
+    if (c == ' ' || i == wifiErrorMessage.length() - 1) {
+      if (i == wifiErrorMessage.length() - 1 && c != ' ') word += c;
+      if (lineLen + word.length() > 20) {
+        lineY += 25;
+        lineLen = 0;
+        tft.setCursor(20, lineY);
+      }
+      tft.print(word + " ");
+      lineLen += word.length() + 1;
+      word = "";
+    } else {
+      word += c;
+    }
+  }
+  
+  // Instruction
+  tft.setTextSize(2);
+  tft.setCursor(20, 220);
+  if (wifiErrorInstruction.length() > 0) {
+    tft.print(wifiErrorInstruction);
+  } else {
+    tft.print("Please restart device");
+  }
+  
+  // OK button
+  tft.fillRect(tft.width() / 2 - 40, tft.height() - 60, 80, 40, TFT_WHITE);
+  tft.setTextColor(ALARM_COLOR);
+  tft.setTextSize(2);
+  tft.setCursor(tft.width() / 2 - 15, tft.height() - 45);
+  tft.print("OK");
+}
+
+void drawControlConfirmation() {
+  tft.fillScreen(BACKGROUND_COLOR);
+  tft.setTextColor(TEXT_COLOR);
+  
+  // Title
+  tft.setTextSize(3);
+  tft.setCursor(20, 15);
+  tft.print("Control");
+  
+  // Timer - clear area first
+  tft.fillRect(270, 15, 50, 20, BACKGROUND_COLOR);
+  unsigned long elapsed = (millis() - confirmationStartTime) / 1000;
+  int remaining = pendingConfirmation.timeout_seconds - elapsed;
+  if (remaining < 0) remaining = 0;
+  tft.setTextSize(2);
+  tft.setCursor(270, 15);
+  tft.printf("%ds", remaining);
+  
+  // Control details
+  tft.setTextSize(2);
+  tft.setCursor(20, 60);
+  tft.print("Action:");
+  tft.setCursor(20, 85);
+  tft.print(pendingConfirmation.control.action);
+  
+  tft.setCursor(20, 120);
+  tft.print("Medicine:");
+  tft.setCursor(20, 145);
+  tft.print(pendingConfirmation.control.medicine_name);
+  
+  tft.setCursor(20, 180);
+  tft.printf("Container: %d", pendingConfirmation.control.container_id);
+  
+  tft.setCursor(20, 205);
+  tft.printf("Quantity: %d", pendingConfirmation.control.quantity);
+  
+  // Message if available
+  if (pendingConfirmation.control.message.length() > 0) {
+    tft.setCursor(20, 230);
+    tft.print(pendingConfirmation.control.message);
+  }
+  
+  // Confirm button (left side, bigger for elderly)
+  tft.fillRect(10, tft.height() - 70, 145, 60, SUCCESS_COLOR);
+  tft.drawRect(10, tft.height() - 70, 145, 60, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(3);
+  tft.setCursor(20, tft.height() - 55);
+  tft.print("CONFIRM");
+  
+  // Cancel button (right side, bigger for elderly)
+  tft.fillRect(165, tft.height() - 70, 145, 60, ALARM_COLOR);
+  tft.drawRect(165, tft.height() - 70, 145, 60, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(3);
+  tft.setCursor(185, tft.height() - 55);
+  tft.print("CANCEL");
 }
 
 int getActiveContainerCount() {
