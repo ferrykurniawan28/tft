@@ -504,7 +504,9 @@ void processIncomingData(String jsonData) {
     hasPendingConfirmation = true;
     confirmationStartTime = millis();
     
-    pendingConfirmation.type = doc["confirmation_type"] | 0; // 0=medication, 1=device_control
+    // Read request_type (sent by minder) and convert to type number
+    String requestType = doc["request_type"] | "medication";
+    pendingConfirmation.type = (requestType == "device_control") ? 1 : 0; // 0=medication, 1=device_control
     pendingConfirmation.timeout_seconds = doc["timeout_seconds"] | 60;
     pendingConfirmation.sent_at = millis();
     
@@ -527,14 +529,13 @@ void processIncomingData(String jsonData) {
       currentState = STATE_TAKE_MEDICINE;
       
     } else if (pendingConfirmation.type == 1) {
-      // Device control confirmation
-      JsonObject controlObj = doc["control"];
-      pendingConfirmation.control.control_id = controlObj["control_id"] | 0;
-      pendingConfirmation.control.action = controlObj["action"] | "";
-      pendingConfirmation.control.medicine_name = controlObj["medicine_name"] | "";
-      pendingConfirmation.control.container_id = controlObj["container_id"] | 0;
-      pendingConfirmation.control.quantity = controlObj["quantity"] | 0;
-      pendingConfirmation.control.message = controlObj["message"] | "";
+      // Device control confirmation - read from root of JSON
+      pendingConfirmation.control.control_id = doc["control_id"] | 0;
+      pendingConfirmation.control.action = doc["action"] | "";
+      pendingConfirmation.control.medicine_name = doc["medicine_name"] | "";
+      pendingConfirmation.control.container_id = doc["container_id"] | 0;
+      pendingConfirmation.control.quantity = doc["quantity"] | 0;
+      pendingConfirmation.control.message = doc["message"] | "";
       
       currentState = STATE_CONTROL_QUEUE_CONFIRMATION;
     }
