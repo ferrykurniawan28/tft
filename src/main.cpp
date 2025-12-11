@@ -126,10 +126,18 @@ int dispensingContainer = 0;
 int dispensingDosage = 0;
 bool dispensingComplete = false;
 String dispensingMedicineName = "";
+unsigned long dispensingStartTime = 0;
+const unsigned long DISPENSING_TIMEOUT = 30000; // 30 seconds
 
 // Sensor data
 float currentTemperature = 0.0;
 float currentHumidity = 0.0;
+
+// Safe ranges for sensor data
+const float TEMP_MIN_SAFE = 15.0;     // Minimum safe temperature (°C)
+const float TEMP_MAX_SAFE = 30.0;     // Maximum safe temperature (°C)
+const float HUMIDITY_MIN_SAFE = 30.0; // Minimum safe humidity (%)
+const float HUMIDITY_MAX_SAFE = 70.0; // Maximum safe humidity (%)
 
 // Confirmation state
 PendingConfirmation pendingConfirmation;
@@ -152,6 +160,16 @@ String apModeMessage = "";
 
 // Clock display
 String currentTimeString = "--:--";
+
+// ⭐ NEW: Hybrid Architecture - Operation Mode Tracking
+char operationMode[10] = "offline";  // "online" or "offline" - default offline until confirmed
+int pendingActionsCount = 0;         // Number of unsynced actions
+char lastOperationMode[10] = "offline"; // Track mode changes
+int lastPendingActions = 0;          // Track sync progress
+
+// ⭐ NEW: Alert source tracking
+char alertSource[20] = "mqtt";       // "mqtt", "dailylog", or "reminder"
+char alertOperationMode[10] = "offline"; // Mode when alert triggered - default offline
 
 // Colors
 #define BACKGROUND_COLOR 0x18E3
@@ -218,6 +236,13 @@ void handleQuantityConfirmationTouch(int x, int y);
 void handleJamAlertTouch(int x, int y);
 void handleWiFiErrorTouch(int x, int y);
 void handleControlQueueConfirmationTouch(int x, int y);
+
+// ⭐ NEW: Hybrid Architecture UI Functions
+// void drawModeBadge();
+void drawPendingActionsBadge();
+void showToast(const char* message, uint16_t color, int duration = 2000);
+void onModeChangeToOffline();
+void onModeChangeToOnline(int actionsSynced);
 
 
 void setup() {
@@ -483,6 +508,26 @@ void processIncomingData(String jsonData) {
     currentHumidity = doc["humidity"] | 0.0;
     isInAPMode = apMode;
     
+    // Hybrid Architecture: Parse operation mode and pending actions
+    const char* newMode = doc["operation_mode"] | "offline";
+    int newPending = doc["pending_actions"] | 0;
+    
+    // Detect mode changes and trigger callbacks
+    if (strcmp(lastOperationMode, newMode) != 0) {
+      if (strcmp(newMode, "offline") == 0) {
+        onModeChangeToOffline();
+      } else if (strcmp(newMode, "online") == 0) {
+        int syncedCount = lastPendingActions - newPending;
+        onModeChangeToOnline(syncedCount);
+      }
+      strcpy(lastOperationMode, newMode);
+    }
+    
+    // Store current state
+    strcpy(operationMode, newMode);
+    pendingActionsCount = newPending;
+    lastPendingActions = newPending;
+    
     // Force redraw current screen to show updated status
     tft.fillScreen(BACKGROUND_COLOR);
     switch (currentState) {
@@ -559,6 +604,12 @@ void processIncomingData(String jsonData) {
     String message = doc["notes"] | "";
     String timeStr = doc["reminder_time"] | "";
     
+    // Hybrid Architecture: Parse source and operation mode
+    const char* source = doc["source"] | "mqtt";
+    const char* mode = doc["operation_mode"] | "online";
+    strcpy(alertSource, source);
+    strcpy(alertOperationMode, mode);
+    
     showReminderAlert(medicineName, containerId, dosage, alertType, message, timeStr);
     
   } else if (type == "grouped_reminder_alert") {
@@ -575,6 +626,9 @@ void processIncomingData(String jsonData) {
     dispensingDosage = doc["dosage"] | 0;
     
     if (dispStatus == "started" || dispStatus == "in_progress") {
+      if (!isDispensing) {
+        dispensingStartTime = millis(); // Record start time
+      }
       isDispensing = true;
       dispensingComplete = false;
       if (currentState != STATE_DISPENSING) {
@@ -1034,6 +1088,120 @@ void showStartupScreen() {
   tft.fillScreen(BACKGROUND_COLOR);
 }
 
+// ==================== HYBRID ARCHITECTURE UI FUNCTIONS ====================
+
+// void drawModeBadge() {
+//   // Draw mode badge in top-right corner (below status icons)
+//   int badgeWidth = 60;
+//   int badgeHeight = 18;
+//   int badgeX = tft.width() - badgeWidth - 5;
+//   int badgeY = 25; // Below the WiFi/MQTT icons
+  
+//   uint16_t bgColor, textColor;
+//   const char* label;
+  
+//   // Determine mode: use operationMode if set, otherwise infer from WiFi/MQTT status
+//   bool isOffline = (strcmp(operationMode, "offline") == 0) || 
+//                    (!wifiConnected && !isInAPMode) || 
+//                    (!mqttConnected && wifiConnected);
+  
+//   if (isOffline) {
+//     bgColor = TFT_ORANGE;
+//     textColor = TFT_BLACK;
+//     label = "OFFLINE";
+//   } else {
+//     bgColor = TFT_GREEN;
+//     textColor = TFT_BLACK;
+//     label = "ONLINE";
+//   }
+  
+//   // Draw badge background
+//   tft.fillRoundRect(badgeX, badgeY, badgeWidth, badgeHeight, 4, bgColor);
+  
+//   // Draw text
+//   tft.setTextColor(textColor);
+//   tft.setTextSize(1);
+//   int textWidth = strlen(label) * 6; // Approximate width
+//   int textX = badgeX + (badgeWidth - textWidth) / 2;
+//   int textY = badgeY + 5;
+//   tft.setCursor(textX, textY);
+//   tft.print(label);
+// }
+
+void drawPendingActionsBadge() {
+  // Only show if there are pending actions
+  if (pendingActionsCount <= 0) return;
+  
+  int badgeWidth = 85;
+  int badgeHeight = 18;
+  int badgeX = tft.width() - badgeWidth - 5;
+  int badgeY = 48; // Below mode badge
+  
+  // Draw badge background
+  tft.fillRoundRect(badgeX, badgeY, badgeWidth, badgeHeight, 4, TFT_DARKCYAN);
+  
+  // Draw hourglass emoji and count
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(1);
+  
+  char badgeText[20];
+  snprintf(badgeText, sizeof(badgeText), "%c %d pending", 0xE2, pendingActionsCount); // ⏳
+  
+  int textX = badgeX + 5;
+  int textY = badgeY + 5;
+  tft.setCursor(textX, textY);
+  tft.print(badgeText);
+}
+
+void showToast(const char* message, uint16_t color, int duration) {
+  // Toast notification at bottom of screen
+  int toastHeight = 40;
+  int toastY = tft.height() - toastHeight - 10;
+  int toastX = 10;
+  int toastWidth = tft.width() - 20;
+  
+  // Draw toast background
+  tft.fillRoundRect(toastX, toastY, toastWidth, toastHeight, 8, color);
+  tft.drawRoundRect(toastX, toastY, toastWidth, toastHeight, 8, TFT_WHITE);
+  
+  // Draw message
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(1);
+  int textWidth = strlen(message) * 6; // Approximate
+  int textX = toastX + (toastWidth - textWidth) / 2;
+  int textY = toastY + 15;
+  tft.setCursor(textX, textY);
+  tft.print(message);
+  
+  // Auto-dismiss after duration
+  delay(duration);
+  
+  // Clear toast area (redraw background)
+  tft.fillRect(toastX, toastY, toastWidth, toastHeight + 5, BACKGROUND_COLOR);
+}
+
+void onModeChangeToOffline() {
+  // Called when system goes offline
+  Serial.println("MODE CHANGE: Online -> Offline");
+  showToast("Server disconnected", TFT_ORANGE, 2000);
+}
+
+void onModeChangeToOnline(int actionsSynced) {
+  // Called when system comes back online
+  Serial.printf("MODE CHANGE: Offline -> Online (%d actions synced)\n", actionsSynced);
+  showToast("Reconnected to server", TFT_GREEN, 2000);
+  
+  // If actions were synced, show additional toast
+  if (actionsSynced > 0) {
+    delay(100);
+    char syncMsg[50];
+    snprintf(syncMsg, sizeof(syncMsg), "Synced %d action%s", actionsSynced, actionsSynced > 1 ? "s" : "");
+    showToast(syncMsg, TFT_CYAN, 2000);
+  }
+}
+
+// ==================== END HYBRID ARCHITECTURE UI FUNCTIONS ====================
+
 void drawHomeScreen() {
   static String lastTimeString = "";
   static bool lastAPMode = false;
@@ -1083,24 +1251,38 @@ void drawHomeScreen() {
   tft.print(currentTimeString);
   
   // Connection status (smaller, right side)
+  // Hybrid Architecture: Color based on operation mode
+  bool isOnline = (strcmp(operationMode, "online") == 0);
+  uint16_t wifiColor = wifiConnected ? (isOnline ? SUCCESS_COLOR : TFT_ORANGE) : WARNING_COLOR;
+  uint16_t mqttColor = mqttConnected ? (isOnline ? SUCCESS_COLOR : TFT_ORANGE) : WARNING_COLOR;
+  
   tft.setTextSize(3);
   tft.setCursor(250, 60);
   tft.setTextColor(TEXT_COLOR);
   tft.print("W:");
-  tft.setTextColor(wifiConnected ? SUCCESS_COLOR : WARNING_COLOR);
+  tft.setTextColor(wifiColor);
   tft.print(wifiConnected ? "C" : "D");
   
   tft.setTextColor(TEXT_COLOR);
   tft.setCursor(250, 100);
   tft.print("M:");
-  tft.setTextColor(mqttConnected ? SUCCESS_COLOR : WARNING_COLOR);
+  tft.setTextColor(mqttColor);
   tft.print(mqttConnected ? "C" : "D");
   
-  // Sensor data
-  tft.setTextColor(TEXT_COLOR);
+  // Sensor data with color coding
   tft.setTextSize(3);
+  
+  // Temperature - red if out of range, green if safe
+  uint16_t tempColor = (currentTemperature < TEMP_MIN_SAFE || currentTemperature > TEMP_MAX_SAFE) 
+                       ? WARNING_COLOR : SUCCESS_COLOR;
+  tft.setTextColor(tempColor);
   tft.setCursor(10, 60);
   tft.printf("%.1fC", currentTemperature);
+  
+  // Humidity - red if out of range, green if safe
+  uint16_t humColor = (currentHumidity < HUMIDITY_MIN_SAFE || currentHumidity > HUMIDITY_MAX_SAFE) 
+                      ? WARNING_COLOR : SUCCESS_COLOR;
+  tft.setTextColor(humColor);
   tft.setCursor(10, 100);
   tft.printf("%.1f%%", currentHumidity);
   
@@ -1131,6 +1313,10 @@ void drawHomeScreen() {
     tft.setTextSize(1);
     tft.print("Configure WiFi settings");
   }
+  
+  // Hybrid Architecture: Draw mode badge and pending actions (if any)
+  // drawModeBadge();
+  drawPendingActionsBadge();
 }
 
 void drawContainersScreen() {
@@ -1307,6 +1493,17 @@ void drawDispensingScreen() {
         tft.fillRect(30 + i * 30, 220, 20, 15, HIGHLIGHT_COLOR);
       }
     }
+    
+    // Check for timeout (30 seconds) - show warning below animation
+    unsigned long elapsed = millis() - dispensingStartTime;
+    if (elapsed > DISPENSING_TIMEOUT) {
+      tft.setTextColor(WARNING_COLOR);
+      tft.setTextSize(2);
+      tft.setCursor(30, 260);
+      tft.print("Check container!");
+      tft.setCursor(30, 285);
+      tft.print("Possible jam");
+    }
   } else if (dispensingComplete) {
     tft.setTextSize(3);
     tft.setCursor(50, 60);
@@ -1449,6 +1646,34 @@ void drawTakeMedicineConfirmation() {
   tft.setTextSize(3);
   tft.setCursor(20, 15);
   tft.print("Medication");
+  
+  // Hybrid Architecture: Draw source indicator badge
+  // int badgeWidth = 70;
+  // int badgeHeight = 18;
+  // int badgeX = 200;
+  // int badgeY = 18;
+  
+  // const char* sourceLabel;
+  // uint16_t badgeColor;
+  
+  // if (strcmp(alertSource, "mqtt") == 0) {
+  //   sourceLabel = "Server"; // ☁️
+  //   badgeColor = TFT_CYAN;
+  // } else if (strcmp(alertSource, "dailylog") == 0) {
+  //   sourceLabel = "DailyLog"; // 💾
+  //   badgeColor = TFT_DARKCYAN;
+  // } else {
+  //   sourceLabel = "Local"; // 💾
+  //   badgeColor = TFT_DARKGREEN;
+  // }
+  
+  // tft.fillRoundRect(badgeX, badgeY, badgeWidth, badgeHeight, 4, badgeColor);
+  // tft.setTextColor(TFT_WHITE);
+  // tft.setTextSize(1);
+  // int textWidth = strlen(sourceLabel) * 6;
+  // int textX = badgeX + (badgeWidth - textWidth) / 2;
+  // tft.setCursor(textX, badgeY + 5);
+  // tft.print(sourceLabel);
   
   // Timer - clear area first
   tft.fillRect(270, 15, 50, 20, BACKGROUND_COLOR);
@@ -1647,6 +1872,31 @@ void drawControlConfirmation() {
   tft.setTextSize(3);
   tft.setCursor(20, 15);
   tft.print("Control");
+  
+  // Hybrid Architecture: Draw source indicator badge (similar to medication alerts)
+  // int badgeWidth = 70;
+  // int badgeHeight = 18;
+  // int badgeX = 180;
+  // int badgeY = 18;
+  
+  // const char* sourceLabel;
+  // uint16_t badgeColor;
+  
+  // if (strcmp(alertSource, "mqtt") == 0) {
+  //   sourceLabel = "Server";
+  //   badgeColor = TFT_CYAN;
+  // } else {
+  //   sourceLabel = "Local";
+  //   badgeColor = TFT_DARKGREEN;
+  // }
+  
+  // tft.fillRoundRect(badgeX, badgeY, badgeWidth, badgeHeight, 4, badgeColor);
+  // tft.setTextColor(TFT_WHITE);
+  // tft.setTextSize(1);
+  // int textWidth = strlen(sourceLabel) * 6;
+  // int textX = badgeX + (badgeWidth - textWidth) / 2;
+  // tft.setCursor(textX, badgeY + 5);
+  // tft.print(sourceLabel);
   
   // Timer - clear area first
   tft.fillRect(270, 15, 50, 20, BACKGROUND_COLOR);
