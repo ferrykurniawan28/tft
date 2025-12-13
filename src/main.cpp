@@ -35,6 +35,7 @@ enum DisplayState {
   STATE_TAKE_MEDICINE,
   STATE_DISPENSING,
   STATE_QUANTITY_CONFIRMATION,
+  STATE_CONTAINER_SELECTION,
   STATE_JAM_ALERT,
   STATE_WIFI_ERROR,
   STATE_CONTROL_QUEUE_LIST,
@@ -228,11 +229,13 @@ void sendDummyDispensingStatus(const char* status);
 void sendDummyStockAlert();
 void drawTakeMedicineConfirmation();
 void drawQuantityConfirmation();
+void drawContainerSelectionScreen();
 void drawJamAlert();
 void drawWiFiError();
 void drawControlConfirmation();
 void handleTakeMedicineTouch(int x, int y);
 void handleQuantityConfirmationTouch(int x, int y);
+void handleContainerSelectionTouch(int x, int y);
 void handleJamAlertTouch(int x, int y);
 void handleWiFiErrorTouch(int x, int y);
 void handleControlQueueConfirmationTouch(int x, int y);
@@ -701,6 +704,18 @@ void processIncomingData(String jsonData) {
     String message = doc["message"] | "";
     
     showControlQueueResult(queueId, success, message);
+  } else if (type == "ap_mode_started") {
+    String message = doc["message"] | "";
+
+    if (message == "WiFi Setup Mode Active")
+    {
+      isInAPMode = true;
+      apModeMessage = "WiFi Setup Mode\nConnect to: MinderAP\nConfigure WiFi settings";
+      currentState = STATE_HOME;  // Ensure we're on home screen to show the message
+      tft.fillScreen(BACKGROUND_COLOR);
+      drawHomeScreen();
+    }
+    
   }
 }
 
@@ -802,6 +817,9 @@ void handleTouchInput() {
       case STATE_QUANTITY_CONFIRMATION:
         handleQuantityConfirmationTouch(x, y);
         break;
+      case STATE_CONTAINER_SELECTION:
+        handleContainerSelectionTouch(x, y);
+        break;
       case STATE_JAM_ALERT:
         handleJamAlertTouch(x, y);
         break;
@@ -869,7 +887,12 @@ void handleDispensingTouch(int x, int y) {
     int buttonX = tft.width() / 2 - 40;
     int buttonY = tft.height() - 60;
     if (x >= buttonX && x <= buttonX + 80 && y >= buttonY && y <= buttonY + 30) {
-      currentState = STATE_HOME;
+      // If there's still a pending confirmation (from "One More" flow), return to quantity confirmation
+      if (hasPendingConfirmation) {
+        currentState = STATE_QUANTITY_CONFIRMATION;
+      } else {
+        currentState = STATE_HOME;
+      }
     }
   }
 }
@@ -936,17 +959,26 @@ void handleQuantityConfirmationTouch(int x, int y) {
   int oneMoreX = tft.width() - 120;
   int oneMoreY = tft.height() - 60;
   if (x >= oneMoreX && x <= oneMoreX + 100 && y >= oneMoreY && y <= oneMoreY + 40) {
-    // Send one more request
-    StaticJsonDocument<256> doc;
-    doc["type"] = "quantity_confirmed";
-    doc["confirmed"] = false;
-    doc["one_more"] = true;
-    
-    String jsonStr;
-    serializeJson(doc, jsonStr);
-    SerialPort.println(jsonStr);
-    
-    currentState = STATE_DISPENSING;
+    // Check if multiple containers
+    if (hasPendingConfirmation && pendingConfirmation.reminder_count > 1) {
+      // Multiple containers - show selection screen
+      currentState = STATE_CONTAINER_SELECTION;
+    } else {
+      // Single container - dispense directly
+      if (hasPendingConfirmation && pendingConfirmation.reminder_count > 0) {
+        StaticJsonDocument<256> doc;
+        doc["type"] = "dispensing_request";
+        doc["container_id"] = pendingConfirmation.reminders[0].container_id;
+        doc["dosage"] = 1;
+        doc["medicine_name"] = pendingConfirmation.reminders[0].medicine_name;
+        
+        String jsonStr;
+        serializeJson(doc, jsonStr);
+        SerialPort.println(jsonStr);
+        
+        currentState = STATE_DISPENSING;
+      }
+    }
     return;
   }
 }
@@ -1056,6 +1088,9 @@ void updateDisplay() {
       break;
     case STATE_QUANTITY_CONFIRMATION:
       drawQuantityConfirmation();
+      break;
+    case STATE_CONTAINER_SELECTION:
+      drawContainerSelectionScreen();
       break;
     case STATE_JAM_ALERT:
       drawJamAlert();
@@ -1767,6 +1802,97 @@ void drawQuantityConfirmation() {
   tft.print("ONE");
   tft.setCursor(tft.width() - 105, tft.height() - 35);
   tft.print("MORE");
+}
+
+void drawContainerSelectionScreen() {
+  tft.fillScreen(BACKGROUND_COLOR);
+  tft.setTextColor(TEXT_COLOR);
+  
+  // Title
+  tft.setTextSize(3);
+  tft.setCursor(20, 15);
+  tft.print("Select One");
+  
+  // Subtitle
+  tft.setTextSize(2);
+  tft.setCursor(20, 50);
+  tft.print("Which medicine?");
+  
+  // List all containers from pending confirmation
+  int yPos = 90;
+  int itemHeight = 50;
+  
+  if (hasPendingConfirmation) {
+    for (int i = 0; i < pendingConfirmation.reminder_count && i < 10; i++) {
+      // Draw button box
+      uint16_t buttonColor = HIGHLIGHT_COLOR;
+      tft.drawRect(10, yPos, tft.width() - 20, itemHeight, buttonColor);
+      tft.fillRect(11, yPos + 1, tft.width() - 22, itemHeight - 2, 0x2104); // Dark background
+      
+      // Medicine name
+      tft.setTextColor(TEXT_COLOR);
+      tft.setTextSize(2);
+      tft.setCursor(20, yPos + 8);
+      tft.print(pendingConfirmation.reminders[i].medicine_name);
+      
+      // Container info
+      tft.setTextSize(1);
+      tft.setCursor(20, yPos + 30);
+      tft.printf("Container %d | %d pill", 
+                 pendingConfirmation.reminders[i].container_id,
+                 pendingConfirmation.reminders[i].dosage);
+      
+      yPos += itemHeight + 5;
+      
+      // Only show up to 4 items to fit on screen
+      if (i >= 3) break;
+    }
+  }
+  
+  // Back button at bottom
+  tft.fillRect(tft.width() / 2 - 50, tft.height() - 50, 100, 40, WARNING_COLOR);
+  tft.drawRect(tft.width() / 2 - 50, tft.height() - 50, 100, 40, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(tft.width() / 2 - 30, tft.height() - 35);
+  tft.print("BACK");
+}
+
+void handleContainerSelectionTouch(int x, int y) {
+  // Check if any container item was tapped
+  int yPos = 90;
+  int itemHeight = 50;
+  
+  if (hasPendingConfirmation) {
+    for (int i = 0; i < pendingConfirmation.reminder_count && i < 4; i++) {
+      if (x >= 10 && x <= tft.width() - 10 && 
+          y >= yPos && y <= yPos + itemHeight) {
+        // Container selected - send dispensing request
+        StaticJsonDocument<256> doc;
+        doc["type"] = "dispensing_request";
+        doc["container_id"] = pendingConfirmation.reminders[i].container_id;
+        doc["dosage"] = 1; // Dispense one more pill
+        doc["medicine_name"] = pendingConfirmation.reminders[i].medicine_name;
+        
+        String jsonStr;
+        serializeJson(doc, jsonStr);
+        SerialPort.println(jsonStr);
+        
+        currentState = STATE_DISPENSING;
+        return;
+      }
+      
+      yPos += itemHeight + 5;
+    }
+  }
+  
+  // Back button
+  int backX = tft.width() / 2 - 50;
+  int backY = tft.height() - 50;
+  if (x >= backX && x <= backX + 100 && y >= backY && y <= backY + 40) {
+    currentState = STATE_QUANTITY_CONFIRMATION;
+    return;
+  }
 }
 
 void drawJamAlert() {
