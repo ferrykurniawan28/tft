@@ -146,6 +146,10 @@ bool hasPendingConfirmation = false;
 unsigned long confirmationStartTime = 0;
 const unsigned long CONFIRMATION_TIMEOUT = 60000; // 60 seconds
 
+// Quantity confirmation timeout
+unsigned long quantityConfirmationStartTime = 0;
+const unsigned long QUANTITY_CONFIRMATION_TIMEOUT = 30000; // 30 seconds - auto YES
+
 // Jam alert state
 int jamAlertContainer = 0;
 String jamAlertMedicine = "";
@@ -371,6 +375,34 @@ void loop() {
       SerialPort.println(jsonStr);
       
       Serial.println("Confirmation timeout - auto cancelled");
+    }
+  }
+  
+  // Check quantity confirmation timeout (30 seconds - auto YES)
+  if (currentState == STATE_QUANTITY_CONFIRMATION && quantityConfirmationStartTime > 0) {
+    unsigned long elapsed = millis() - quantityConfirmationStartTime;
+    if (elapsed >= QUANTITY_CONFIRMATION_TIMEOUT) {
+      // Timeout - auto confirm YES
+      Serial.println("Quantity confirmation timeout - auto YES");
+      
+      // Send YES confirmation to minder
+      StaticJsonDocument<256> doc;
+      doc["type"] = "quantity_confirmed";
+      doc["confirmed"] = true;
+      doc["timeout"] = true;
+      
+      String jsonStr;
+      serializeJson(doc, jsonStr);
+      SerialPort.println(jsonStr);
+      
+      // Clear state and return to home
+      quantityConfirmationStartTime = 0;
+      if (hasPendingConfirmation) {
+        hasPendingConfirmation = false;
+      }
+      currentState = STATE_HOME;
+      tft.fillScreen(BACKGROUND_COLOR);
+      drawHomeScreen();
     }
   }
   
@@ -645,6 +677,7 @@ void processIncomingData(String jsonData) {
     // All medicines dispensed, show quantity confirmation
     isDispensing = false;
     currentState = STATE_QUANTITY_CONFIRMATION;
+    quantityConfirmationStartTime = millis(); // Start 30-second timeout
     
   } else if (type == "stock_alert") {
     // Stock alert
@@ -1780,10 +1813,23 @@ void drawQuantityConfirmation() {
     if (yPos > tft.height() - 140) break;
   }
   
-  // Question
+  // Question with countdown
   tft.setTextSize(2);
-  tft.setCursor(20, tft.height() - 120);
+  tft.setCursor(20, tft.height() - 140);
   tft.print("Got correct amount?");
+  
+  // Show countdown timer
+  if (quantityConfirmationStartTime > 0) {
+    unsigned long elapsed = millis() - quantityConfirmationStartTime;
+    unsigned long remaining = (QUANTITY_CONFIRMATION_TIMEOUT - elapsed) / 1000;
+    if (remaining <= 30) {
+      tft.setTextSize(2);
+      tft.setCursor(20, tft.height() - 115);
+      tft.setTextColor(WARNING_COLOR);
+      tft.printf("Auto-YES in %lu sec", remaining);
+      tft.setTextColor(TEXT_COLOR);
+    }
+  }
   
   // Yes button (left)
   tft.fillRect(20, tft.height() - 60, 100, 40, SUCCESS_COLOR);
